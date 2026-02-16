@@ -7,25 +7,25 @@
     .\.venv\Scripts\Activate.ps1
     # BERT Project (PDF → Чанки → Поиск → Ответ)
 
-## 1) схема (pipeline)
+## BERT Project (PDF → Чанки → Поиск → Ответ)
+
+## 1) Схема (pipeline)
 
 ```mermaid
 flowchart TD
   A[manual.pdf] --> B[prepare_data.py]
-  B --> C[Извлечение текста из PDF<br/>+ сохранение абзацев]
-  C --> D[Чанкинг<br/>по абзацам/предложениям]
+  B --> C[Извлечение текста из PDF + сохранение абзацев]
+  C --> D[Чанкинг по абзацам/предложениям]
   D --> E[chunks.jsonl<br/>список чанков]
   D --> F[TF-IDF индекс<br/>tfidf.joblib + chunk_meta.joblib]
   D --> G[Semantic embeddings индекс<br/>embeddings.joblib]
 
   H[FastAPI /ask] --> I[Retriever<br/>TF-IDF или Embeddings]
-  I --> J[Top-K чанков<br/>+ фильтр MIN_RETRIEVAL_SCORE]
+  I --> J[Top-K чанков + фильтр MIN_RETRIEVAL_SCORE]
   J -->|если score низкий| K[Ответ: не найдено]
   J -->|если score норм| L[QA модель<br/>MilyaShams/rubert-russian-qa-sberquad]
-  L --> M[Extractive answer (span)<br/>+ score + источник (страница/чанк)]
+  L --> M[Extractive answer span + score + источник страница/чанк]
   M --> N[JSON ответ клиенту]
-
-
 
 
 # 2) Простое объяснение: что делает каждая часть
