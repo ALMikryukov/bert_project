@@ -1,0 +1,377 @@
+C:\Users\Alex\Desktop\bert_project\app\main.py
+from fastapi import FastAPI, HTTPException
+from app.schemas import AskRequest, AskResponse
+from app.settings import settings
+from services.retriever import TfidfRetriever
+from services.qa import ExtractiveQA
+
+app = FastAPI(
+    title="Documentation QA (manual)",
+    description="Отвечает на вопросы, основываясь ТОЛЬКО на предоставленной документации (manual.pdf).",
+    version="0.1.0",
+)
+
+retriever = None
+qa = None
+
+
+@app.on_event("startup")
+def startup():
+    global retriever, qa
+
+    # Проверка: если модель gated/private — нужен токен
+    if settings.HF_TOKEN is None:
+        # Не падаем, просто предупреждаем: модель может не скачаться
+        print("WARNING: HF_TOKEN не задан. Если модель приватная/gated, скачивание упадёт.")
+
+    retriever = TfidfRetriever(settings.TFIDF_PATH, settings.META_PATH)
+
+    qa = ExtractiveQA(
+        model_name=settings.QA_MODEL_NAME,
+        hf_token=settings.HF_TOKEN,
+    )
+
+
+@app.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest):
+    question = req.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Пустой вопрос")
+
+    candidates = retriever.retrieve(question, top_k=settings.TOP_K)
+    if not candidates:
+        return AskResponse(answer="Не нашёл релевантных фрагментов в документации.", found=False)
+
+    result = qa.answer_best(
+        question=question,
+        candidates=candidates,
+        min_answer_score=settings.MIN_ANSWER_SCORE,
+    )
+
+    if result.get("found"):
+        return AskResponse(
+            answer=result["answer"],
+            found=True,
+            source=result["source"],
+            scores=result["scores"],
+        )
+
+    return AskResponse(
+        answer=result["answer"],
+        found=False,
+    )
+
+C:\Users\Alex\Desktop\bert_project\app\schemas.py
+
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+
+
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, description="Вопрос по документации")
+
+
+class AskResponse(BaseModel):
+    answer: str
+    found: bool
+    source: Optional[Dict[str, Any]] = None
+    scores: Optional[Dict[str, float]] = None
+
+C:\Users\Alex\Desktop\bert_project\app\settings.py
+
+import os
+from pydantic import BaseModel, Field
+
+
+class Settings(BaseModel):
+    # Русская QA модель (extractive)
+    QA_MODEL_NAME: str = Field(default="Den4ikAI/rubert-large-squad")
+
+    # токен можно оставить (не мешает), обычно не нужен для публичных моделей
+    HF_TOKEN: str | None = Field(
+        default_factory=lambda: os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    )
+
+    TFIDF_PATH: str = "data/tfidf.joblib"
+    META_PATH: str = "data/chunk_meta.joblib"
+
+    TOP_K: int = 5
+    MIN_ANSWER_SCORE: float = 0.25
+
+
+settings = Settings()
+
+C:\Users\Alex\Desktop\bert_project\services\chunking.py
+
+
+
+def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150, min_len: int = 200):
+    """
+    Простой чанкинг по символам с overlap.
+    Для MVP достаточно. Потом можно заменить на чанкинг по предложениям (spaCy).
+    """
+    text = (text or "").strip()
+    if len(text) < min_len:
+        return []
+
+    chunks = []
+    start = 0
+    step = max(1, chunk_size - overlap)
+
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        chunk = text[start:end].strip()
+        if len(chunk) >= min_len:
+            chunks.append(chunk)
+        start += step
+
+    return chunks
+C:\Users\Alex\Desktop\bert_project\services\pdf_extract.py
+
+import re
+import fitz  # pymupdf
+
+
+def normalize_pdf_text(text: str) -> str:
+    text = text.replace("\x00", " ")
+    # Склеиваем переносы слов: "управле-\nния" -> "управления"
+    text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
+    # Переводы строк -> пробел
+    text = re.sub(r"\s*\n+\s*", " ", text)
+    # Сжимаем пробелы
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
+
+
+def extract_pages_text(pdf_path: str):
+    doc = fitz.open(pdf_path)
+    pages = []
+    for i in range(len(doc)):
+        page = doc[i]
+        text = page.get_text("text") or ""
+        text = normalize_pdf_text(text)
+        pages.append({"page": i + 1, "text": text})
+    doc.close()
+    return pages
+
+from typing import Dict, Any, List, Optional
+from transformers import AutoTokenizer, AutoModelForQuestionAnswering, pipeline
+
+
+class ExtractiveQA:
+    def __init__(self, model_name: str, hf_token: Optional[str] = None):
+        self.model_name = model_name
+
+        # use_fast=False стабильнее для некоторых токенизаторов на Windows
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_fast=False,
+            token=hf_token,
+        )
+        self.model = AutoModelForQuestionAnswering.from_pretrained(
+            model_name,
+            token=hf_token,
+        )
+
+        self.qa = pipeline(
+            "question-answering",
+            model=self.model,
+            tokenizer=self.tokenizer,
+        )
+
+        # Параметры, чтобы не падало на длинных чанках
+        self.max_seq_len = 384
+        self.doc_stride = 128
+        self.max_question_len = 64
+
+        # для отладки
+        self.last_skipped_chunks = 0
+
+    def _safe_context(self, context: str, max_chars: int = 2000) -> str:
+        context = (context or "").strip()
+        if len(context) > max_chars:
+            context = context[:max_chars]
+        return context
+
+    def answer_best(
+        self,
+        question: str,
+        candidates: List[Dict[str, Any]],
+        min_answer_score: float = 0.25,
+    ) -> Dict[str, Any]:
+        best = None
+        skipped = 0
+
+        for c in candidates:
+            context = self._safe_context(c["chunk"]["text"])
+
+            try:
+                out = self.qa(
+                    question=question,
+                    context=context,
+                    max_seq_len=self.max_seq_len,
+                    doc_stride=self.doc_stride,
+                    max_question_len=self.max_question_len,
+                    handle_impossible_answer=True,
+                )
+            except Exception:
+                skipped += 1
+                continue
+
+            answer = (out.get("answer") or "").strip()
+            qa_score = float(out.get("score", 0.0))
+
+            merged = {
+                "answer": answer,
+                "qa_score": qa_score,
+                "retrieval_score": float(c["score"]),
+                "chunk_id": c["chunk_id"],
+                "doc_id": c["chunk"]["doc_id"],
+                "page": c["chunk"]["page"],
+            }
+
+            if best is None or merged["qa_score"] > best["qa_score"]:
+                best = merged
+
+        self.last_skipped_chunks = skipped
+
+        if best is None or best["qa_score"] < min_answer_score or len(best["answer"]) < 2:
+            return {
+                "answer": "Не нашёл ответ в предоставленной документации.",
+                "found": False,
+                "debug": {
+                    "model": self.model_name,
+                    "skipped_chunks": skipped,
+                    "candidates": len(candidates),
+                },
+            }
+
+        return {
+            "answer": best["answer"],
+            "found": True,
+            "source": {
+                "doc_id": best["doc_id"],
+                "page": best["page"],
+                "chunk_id": best["chunk_id"],
+            },
+            "scores": {
+                "qa_score": best["qa_score"],
+                "retrieval_score": best["retrieval_score"],
+            },
+            "debug": {
+                "model": self.model_name,
+                "skipped_chunks": skipped,
+                "candidates": len(candidates),
+            },
+        }
+
+C:\Users\Alex\Desktop\bert_project\services\retriever.py
+
+from typing import List, Dict, Any
+import numpy as np
+import joblib
+
+
+class TfidfRetriever:
+    def __init__(self, tfidf_path: str, meta_path: str):
+        self.vectorizer = joblib.load(tfidf_path)
+        meta = joblib.load(meta_path)
+        self.X = meta["X"]               # sparse matrix [n_chunks, n_features]
+        self.chunks = meta["chunks"]     # list of dicts
+
+    def retrieve(self, question: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        q = (question or "").strip()
+        if not q:
+            return []
+
+        q_vec = self.vectorizer.transform([q])  # [1, n_features]
+        # Косинусная близость для TF-IDF при нормировке sklearn обычно ок через dot
+        scores = (self.X @ q_vec.T).toarray().ravel()  # [n_chunks]
+
+        if scores.size == 0:
+            return []
+
+        top_idx = np.argsort(scores)[::-1][:top_k]
+
+        results = []
+        for idx in top_idx:
+            results.append({
+                "score": float(scores[idx]),
+                "chunk": self.chunks[idx],
+                "chunk_id": int(idx),
+            })
+        return results
+C:\Users\Alex\Desktop\bert_project\prepare_data.py
+import os
+import json
+from pathlib import Path
+
+import joblib
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+from services.pdf_extract import extract_pages_text
+from services.chunking import chunk_text
+
+PROJECT_DIR = Path(".")
+PDF_PATH = PROJECT_DIR / "manual.pdf"
+DATA_DIR = PROJECT_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+CHUNKS_PATH = DATA_DIR / "chunks.jsonl"
+TFIDF_PATH = DATA_DIR / "tfidf.joblib"
+META_PATH = DATA_DIR / "chunk_meta.joblib"
+
+
+def main():
+    if not PDF_PATH.exists():
+        raise FileNotFoundError(f"Не найден файл: {PDF_PATH.resolve()}")
+
+    pages = extract_pages_text(str(PDF_PATH))  # list of {"page": int, "text": str}
+
+    chunks = []
+    for p in pages:
+        page_num = p["page"]
+        text = p["text"]
+        for ch in chunk_text(
+            text,
+            chunk_size=900,     # символы (MVP)
+            overlap=150,
+            min_len=200
+        ):
+            chunks.append({
+                "doc_id": "manual",
+                "page": page_num,
+                "text": ch
+            })
+
+    # Сохраним чанки в jsonl
+    with CHUNKS_PATH.open("w", encoding="utf-8") as f:
+        for row in chunks:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    # TF-IDF
+    corpus = [c["text"] for c in chunks]
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        ngram_range=(1, 2),
+        max_features=80_000
+    )
+    X = vectorizer.fit_transform(corpus)
+
+    # Сохраним модель и матрицу + мету
+    joblib.dump(vectorizer, TFIDF_PATH)
+    joblib.dump(
+        {
+            "X": X,
+            "chunks": chunks
+        },
+        META_PATH
+    )
+
+    print("Готово!")
+    print(f"chunks: {len(chunks)}")
+    print(f"saved: {CHUNKS_PATH}, {TFIDF_PATH}, {META_PATH}")
+
+
+if __name__ == "__main__":
+    main()

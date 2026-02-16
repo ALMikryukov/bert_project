@@ -1,0 +1,15 @@
+fastapi==0.115.6
+uvicorn[standard]==0.30.6
+
+transformers==4.44.2
+torch>=2.0.0
+
+scikit-learn==1.5.2
+joblib==1.4.2
+
+pymupdf==1.24.10
+
+huggingface_hub>=0.24.6
+sentencepiece==0.2.1
+protobuf>=4.25.0
+numpy<2.0
